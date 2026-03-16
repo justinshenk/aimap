@@ -1,0 +1,200 @@
+"""Project SPECTER2 embeddings to 2D via UMAP and cluster with HDBSCAN."""
+
+from pathlib import Path
+
+import duckdb
+import hdbscan
+import numpy as np
+import pyarrow.parquet as pq
+import umap
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+DB_PATH = DATA_DIR / "aimap.duckdb"
+
+
+def load_data():
+    """Load papers metadata and embeddings."""
+    papers = pq.read_table(DATA_DIR / "papers.parquet").to_pydict()
+    embeddings = np.load(DATA_DIR / "embeddings.npy")
+    print(f"Loaded {len(papers['paper_id'])} papers with {embeddings.shape[1]}-dim embeddings")
+    return papers, embeddings
+
+
+def run_umap(embeddings: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1) -> np.ndarray:
+    """Reduce embeddings to 2D with UMAP."""
+    print("Running UMAP...")
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        metric="cosine",
+        random_state=42,
+        verbose=True,
+    )
+    coords = reducer.fit_transform(embeddings)
+    print(f"UMAP complete: {coords.shape}")
+    return coords
+
+
+def run_clustering(coords: np.ndarray, min_cluster_size: int = 50) -> np.ndarray:
+    """Cluster papers using HDBSCAN on 2D UMAP coordinates."""
+    print("Running HDBSCAN on 2D coords...")
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=5,
+        metric="euclidean",
+        cluster_selection_method="eom",
+    )
+    labels = clusterer.fit_predict(coords)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    noise = (labels == -1).sum()
+    print(f"Found {n_clusters} clusters, {noise} noise points")
+    return labels
+
+
+def generate_cluster_labels(papers: dict, cluster_ids: np.ndarray) -> dict[int, str]:
+    """Generate human-readable labels for each cluster using TF-IDF on titles."""
+    unique_clusters = sorted(set(cluster_ids))
+    labels = {}
+
+    for cid in unique_clusters:
+        if cid == -1:
+            labels[cid] = "Unclustered"
+            continue
+
+        mask = cluster_ids == cid
+        titles = [papers["title"][i] for i in range(len(mask)) if mask[i]]
+
+        if len(titles) < 3:
+            labels[cid] = f"Cluster {cid}"
+            continue
+
+        # TF-IDF on cluster titles vs all titles
+        vectorizer = TfidfVectorizer(
+            max_features=1000, stop_words="english", ngram_range=(1, 2)
+        )
+        try:
+            tfidf = vectorizer.fit_transform(titles)
+            mean_tfidf = tfidf.mean(axis=0).A1
+            top_indices = mean_tfidf.argsort()[-3:][::-1]
+            feature_names = vectorizer.get_feature_names_out()
+            top_terms = [feature_names[i] for i in top_indices]
+            labels[cid] = " / ".join(top_terms)
+        except Exception:
+            labels[cid] = f"Cluster {cid}"
+
+    return labels
+
+
+def compute_cluster_centroids(coords: np.ndarray, cluster_ids: np.ndarray) -> dict:
+    """Compute 2D centroid for each cluster."""
+    centroids = {}
+    for cid in set(cluster_ids):
+        if cid == -1:
+            continue
+        mask = cluster_ids == cid
+        centroids[int(cid)] = {
+            "x": float(coords[mask, 0].mean()),
+            "y": float(coords[mask, 1].mean()),
+            "count": int(mask.sum()),
+        }
+    return centroids
+
+
+def save_to_duckdb(papers: dict, coords: np.ndarray, cluster_ids: np.ndarray,
+                   cluster_labels: dict, cluster_centroids: dict):
+    """Write everything to DuckDB."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(DB_PATH))
+
+    con.execute("DROP TABLE IF EXISTS papers")
+    con.execute("""
+        CREATE TABLE papers (
+            paper_id VARCHAR PRIMARY KEY,
+            title VARCHAR,
+            abstract VARCHAR,
+            year INTEGER,
+            venue VARCHAR,
+            authors VARCHAR,
+            citation_count INTEGER,
+            fields_of_study VARCHAR,
+            publication_date VARCHAR,
+            arxiv_id VARCHAR,
+            x DOUBLE,
+            y DOUBLE,
+            cluster_id INTEGER
+        )
+    """)
+
+    n = len(papers["paper_id"])
+    for i in range(n):
+        con.execute(
+            "INSERT INTO papers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                papers["paper_id"][i],
+                papers["title"][i],
+                papers["abstract"][i],
+                papers["year"][i],
+                papers["venue"][i],
+                papers["authors"][i],
+                papers["citation_count"][i],
+                papers["fields_of_study"][i],
+                papers["publication_date"][i],
+                papers["arxiv_id"][i],
+                float(coords[i, 0]),
+                float(coords[i, 1]),
+                int(cluster_ids[i]),
+            ],
+        )
+
+    con.execute("DROP TABLE IF EXISTS clusters")
+    con.execute("""
+        CREATE TABLE clusters (
+            cluster_id INTEGER PRIMARY KEY,
+            label VARCHAR,
+            centroid_x DOUBLE,
+            centroid_y DOUBLE,
+            paper_count INTEGER
+        )
+    """)
+
+    for cid, label in cluster_labels.items():
+        if cid == -1:
+            continue
+        centroid = cluster_centroids.get(cid, {"x": 0, "y": 0, "count": 0})
+        con.execute(
+            "INSERT INTO clusters VALUES (?, ?, ?, ?, ?)",
+            [int(cid), label, centroid["x"], centroid["y"], centroid["count"]],
+        )
+
+    con.close()
+    print(f"Saved to {DB_PATH}")
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Project embeddings and cluster papers")
+    parser.add_argument("--n-neighbors", type=int, default=15, help="UMAP n_neighbors")
+    parser.add_argument("--min-dist", type=float, default=0.1, help="UMAP min_dist")
+    parser.add_argument("--min-cluster-size", type=int, default=50, help="HDBSCAN min_cluster_size")
+    args = parser.parse_args()
+
+    papers, embeddings = load_data()
+    coords = run_umap(embeddings, n_neighbors=args.n_neighbors, min_dist=args.min_dist)
+    # Cluster on 2D UMAP coords — much better cluster separation than high-dim
+    cluster_ids = run_clustering(coords, min_cluster_size=args.min_cluster_size)
+    cluster_labels = generate_cluster_labels(papers, cluster_ids)
+    cluster_centroids = compute_cluster_centroids(coords, cluster_ids)
+
+    print("\nCluster labels:")
+    for cid, label in sorted(cluster_labels.items()):
+        count = cluster_centroids.get(cid, {}).get("count", 0)
+        print(f"  [{cid}] {label} ({count} papers)")
+
+    save_to_duckdb(papers, coords, cluster_ids, cluster_labels, cluster_centroids)
+
+
+if __name__ == "__main__":
+    main()
