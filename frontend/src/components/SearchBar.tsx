@@ -1,12 +1,12 @@
 import { useState, useCallback, useRef } from "react";
-import { searchPapers } from "../hooks/useData";
 import type { PaperPoint } from "../types";
 
 interface Props {
+  points: PaperPoint[];
   onResults: (ids: Set<string>) => void;
 }
 
-export default function SearchBar({ onResults }: Props) {
+export default function SearchBar({ points, onResults }: Props) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<PaperPoint[]>([]);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -22,13 +22,16 @@ export default function SearchBar({ onResults }: Props) {
         return;
       }
 
-      debounceRef.current = setTimeout(async () => {
-        const papers = await searchPapers(value);
-        setResults(papers);
-        onResults(new Set(papers.map((p) => p.id)));
-      }, 300);
+      debounceRef.current = setTimeout(() => {
+        const lower = value.toLowerCase();
+        const matched = points
+          .filter((p) => p.title.toLowerCase().includes(lower))
+          .slice(0, 50);
+        setResults(matched);
+        onResults(new Set(matched.map((p) => p.id)));
+      }, 200);
     },
-    [onResults]
+    [points, onResults]
   );
 
   return (
@@ -49,7 +52,7 @@ export default function SearchBar({ onResults }: Props) {
         style={{
           width: "100%",
           padding: "10px 14px",
-          background: "#1a1a2e",
+          background: "rgba(20, 20, 40, 0.9)",
           border: "1px solid #333",
           borderRadius: "8px",
           color: "#e0e0e0",
@@ -61,7 +64,7 @@ export default function SearchBar({ onResults }: Props) {
         <div
           style={{
             marginTop: "4px",
-            background: "#1a1a2e",
+            background: "rgba(20, 20, 40, 0.95)",
             border: "1px solid #333",
             borderRadius: "8px",
             maxHeight: "300px",
@@ -79,12 +82,11 @@ export default function SearchBar({ onResults }: Props) {
                 padding: "8px 12px",
                 borderTop: "1px solid #222",
                 color: "#ccc",
-                cursor: "pointer",
               }}
             >
               <div style={{ fontWeight: 500 }}>{p.title}</div>
               <div style={{ color: "#888", marginTop: "2px" }}>
-                {p.year} | {p.citation_count} citations
+                {p.year} | {p.citation_count.toLocaleString()} citations
               </div>
             </div>
           ))}

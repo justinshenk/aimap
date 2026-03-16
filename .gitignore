@@ -8,3 +8,4 @@ dist/
 .vite/
 *.egg-info/
 .DS_Store
+.vercel

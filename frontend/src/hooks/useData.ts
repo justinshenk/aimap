@@ -1,8 +1,25 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { PaperPoint, PaperDetail, Cluster } from "../types";
 
-// For Vercel: load from static JSON files instead of API
+// Caches
+let pointsData: { points: PaperPoint[]; clusters: Cluster[] } | null = null;
 let papersCache: Record<string, PaperDetail> | null = null;
+let pointsFetchPromise: Promise<{ points: PaperPoint[]; clusters: Cluster[] }> | null = null;
+
+async function loadPointsData() {
+  if (pointsData) return pointsData;
+  if (pointsFetchPromise) return pointsFetchPromise;
+  pointsFetchPromise = fetch("/points.json")
+    .then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .then((data) => {
+      pointsData = data;
+      return data;
+    });
+  return pointsFetchPromise;
+}
 
 export function usePoints() {
   const [points, setPoints] = useState<PaperPoint[]>([]);
@@ -10,11 +27,7 @@ export function usePoints() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/points.json")
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    loadPointsData()
       .then((data) => setPoints(data.points))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
@@ -27,8 +40,7 @@ export function useClusters() {
   const [clusters, setClusters] = useState<Cluster[]>([]);
 
   useEffect(() => {
-    fetch("/points.json")
-      .then((r) => r.json())
+    loadPointsData()
       .then((data) => setClusters(data.clusters))
       .catch(console.error);
   }, []);
@@ -54,13 +66,31 @@ export async function fetchPaperDetail(
   }
 }
 
-export async function searchPapers(query: string): Promise<PaperPoint[]> {
-  // Client-side search — filter the already-loaded points
-  // This is a simple substring match; for production, use something like Fuse.js
-  const r = await fetch("/points.json");
-  const data = await r.json();
-  const q = query.toLowerCase();
-  return data.points
-    .filter((p: PaperPoint) => p.title.toLowerCase().includes(q))
-    .slice(0, 50);
+export function useSearch(points: PaperPoint[]) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<PaperPoint[]>([]);
+  const [highlightIds, setHighlightIds] = useState<Set<string>>(new Set());
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  const search = (q: string) => {
+    setQuery(q);
+    clearTimeout(debounceRef.current);
+
+    if (q.length < 2) {
+      setResults([]);
+      setHighlightIds(new Set());
+      return;
+    }
+
+    debounceRef.current = setTimeout(() => {
+      const lower = q.toLowerCase();
+      const matched = points
+        .filter((p) => p.title.toLowerCase().includes(lower))
+        .slice(0, 50);
+      setResults(matched);
+      setHighlightIds(new Set(matched.map((p) => p.id)));
+    }, 200);
+  };
+
+  return { query, search, results, highlightIds };
 }
